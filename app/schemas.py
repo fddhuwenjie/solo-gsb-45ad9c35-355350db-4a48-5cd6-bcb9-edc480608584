@@ -393,3 +393,68 @@ class BgpAuditResponse(BaseModel):
             "Sorted by network address, then prefix length, then announcement id"
         ),
     )
+
+
+# ---------------------------------------------------------------------------
+# Confirmable BGP announcement plans
+# ---------------------------------------------------------------------------
+
+
+class BgpPlanCreateRequest(BaseModel):
+    plan_id: str = Field(
+        ...,
+        min_length=1,
+        description="Client-generated idempotency key for the announcement plan",
+    )
+    relationships: list[AsRelation] = Field(
+        default_factory=list,
+        description="AS relationships used to audit every announcement path",
+    )
+    announcements: list[BgpAnnouncement] = Field(
+        ...,
+        min_length=1,
+        description="Announcements the network team intends to publish; ids unique",
+    )
+
+
+class BgpPlanAllocationState(BaseModel):
+    cidr: str
+    request_id: str
+    prefix_length: int
+    created_at: str
+
+
+class BgpPlanPoolState(BaseModel):
+    """Immutable summary of the pool state the plan was pinned against."""
+
+    cidr: str
+    exclusions: list[str] = Field(
+        ..., description="Exclusion CIDRs, sorted by numeric network address"
+    )
+    allocations: list[BgpPlanAllocationState] = Field(
+        ..., description="Current allocations, sorted by numeric network address"
+    )
+
+
+class BgpPlanResponse(BaseModel):
+    plan_id: str
+    pool_id: int
+    status: Literal["planned", "active"]
+    results: list[BgpAuditResult] = Field(
+        ...,
+        description="Audit results produced at creation time and stored with the plan"
+    )
+    state_digest: str = Field(
+        ...,
+        description=(
+            "SHA-256 hex digest of the canonical pool-state summary "
+            "(pool CIDR, exclusions, allocations) fixed at creation"
+        ),
+    )
+    pool_state: BgpPlanPoolState
+    created_at: str
+    activated_at: str | None = None
+    replayed: bool = Field(
+        ...,
+        description="True when a stored plan was returned instead of creating one",
+    )

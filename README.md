@@ -13,6 +13,10 @@
 - 可将地址池**分区迁移**为一组两两不重叠、恰好覆盖源池的子池：全部校验与替换在**同一个写事务**内完成，排除网段与已分配子网按归属整体迁入子池（`operation_id` 幂等重放）
 - 可将按优先级排列的 CIDR 允许/拒绝规则**编译**为覆盖整个 scope 的不重叠分段（只读，不触碰地址池与分配数据）
 - 可对 BGP 公告做**无状态 AS 路径审计与 MOAS / 起源变更比对**（只计算，不读写数据库）
+- 可创建**可确认的 BGP 公告计划**：创建时在一致读事务中固定池的排除网段与当前分配、
+  复用 AS 路径审计并校验前缀完全位于池内/不碰排除网段/覆盖全部当前分配/同一分配单一起源，
+  保存不可变计划与池状态摘要；激活时在单个写事务内重新核对，池状态一旦变化即返回冲突、绝不部分生效
+  （`plan_id` 幂等重放）
 - 一条命令启动，监听 **8000** 端口
 
 ## 快速开始
@@ -60,6 +64,8 @@ SUBNET_DB_PATH=./subnets.db .venv/bin/uvicorn app.main:app --host 0.0.0.0 --port
 | `POST` | `/pools/{id}/partitions` | 将源池分区迁移为一组恰好覆盖它的子池（单写事务，`operation_id` 幂等） |
 | `POST` | `/cidr-policy/compile` | 将优先级 CIDR 规则编译为覆盖 scope 的不重叠动作分段（只读） |
 | `POST` | `/bgp/announcements/audit` | BGP 公告 AS 路径审计与 MOAS / 起源变更比对（无状态，不读写数据库） |
+| `POST` | `/pools/{id}/bgp-plans` | 创建不可变 BGP 公告计划并固定池状态摘要（`plan_id` 幂等） |
+| `POST` | `/pools/{id}/bgp-plans/{plan_id}/activate` | 写事务内重新核对摘要与覆盖关系后激活计划 |
 | `GET` | `/health` | 健康检查 |
 
 ### 1. 创建地址池
@@ -570,6 +576,103 @@ curl -X POST http://localhost:8000/pools/1/partitions \
 `request_id` 幂等键随分配一起归属新子池；子网列表只有一个且等于源池 CIDR 的
 退化分区也是合法请求（源池被同 CIDR 的新池替换，池 id 改变）。
 
+### 13. 可确认的 BGP 公告计划（创建 + 激活）
+
+网络团队在正式发布 BGP 公告前，需要确认公告仍对应当前地址池：池内分配一旦变化，
+旧的公告集合可能覆盖了已释放的地址、或漏掉新分配，绝不能把这种过期路由激活出去。
+本功能提供两个端点：
+
+- `POST /pools/{id}/bgp-plans`：提交 `plan_id`（幂等键）、`relationships`（AS 关系，
+  与审计接口同一格式）与 `announcements`（公告列表），创建一条**不可变**计划；
+- `POST /pools/{id}/bgp-plans/{plan_id}/activate`：在单个写事务内重新核对后，
+  把计划标记为 `active`。
+
+**创建计划**时，先在一个**一致读事务**（`BEGIN`）中读取并固定池的 CIDR、排除网段
+与当前分配，再完成以下全部校验，任一失败均不落库：
+
+1. **复用现有路径审计**：`relationships` / `announcements` 直接交给
+   `/bgp/announcements/audit` 使用的同一审计逻辑。关系冲突、未知关系边、非法前缀、
+   空 AS_PATH、公告 id 重复等请求级错误照旧返回 422；
+2. 每条公告前缀必须**完全位于池内**（`bgp_announcement_outside_pool`），且**不得与
+   任何排除网段重叠**（`bgp_announcement_overlaps_exclusion`）；
+3. **每个当前分配**必须至少被一条审计状态为 `valid` 的公告覆盖
+   （`bgp_allocation_uncovered`）——`as_loop` / `invalid_path` 的公告不能用于覆盖；
+4. 同一分配若被不同起源 AS 的公告覆盖，拒绝（`bgp_allocation_origin_conflict`）。
+
+全部通过后，在写事务中复查读事务以来池状态未变，然后保存：计划参数指纹、
+审计结果（不可变）、池状态摘要（池 CIDR + 按数值排序的排除网段 + 按数值排序的
+当前分配）以及摘要的 **SHA-256 摘要** `state_digest`。计划一经创建即不可变，
+只有 `status` 可从 `planned` 变为 `active`。
+
+```bash
+curl -X POST http://localhost:8000/pools/1/bgp-plans \
+  -H 'Content-Type: application/json' -d '{
+    "plan_id": "release-2026-10-03",
+    "relationships": [
+      {"type": "customer_provider", "customer": 10,  "provider": 100},
+      {"type": "peer",               "a": 100, "b": 50},
+      {"type": "customer_provider", "customer": 60,  "provider": 50}
+    ],
+    "announcements": [
+      {"id": "a0",   "prefix": "203.0.113.0/25",   "as_path": [10, 100]},
+      {"id": "a128", "prefix": "203.0.113.128/25", "as_path": [100, 50, 60]}
+    ]
+  }'
+```
+
+```json
+{
+  "plan_id": "release-2026-10-03",
+  "pool_id": 1,
+  "status": "planned",
+  "results": [
+    {"id": "a0",   "prefix": "203.0.113.0/25",   "as_path": [10, 100],
+     "origin": 100, "status": "valid", "flags": [], "violating_hop": null},
+    {"id": "a128", "prefix": "203.0.113.128/25", "as_path": [100, 50, 60],
+     "origin": 60,  "status": "valid", "flags": [], "violating_hop": null}
+  ],
+  "state_digest": "8f2c...e1",
+  "pool_state": {
+    "cidr": "203.0.113.0/24",
+    "exclusions": [],
+    "allocations": [
+      {"cidr": "203.0.113.0/25",   "request_id": "order-1", "prefix_length": 25, "created_at": "..."},
+      {"cidr": "203.0.113.128/25", "request_id": "order-2", "prefix_length": 25, "created_at": "..."}
+    ]
+  },
+  "created_at": "2026-10-03T09:00:00+00:00",
+  "activated_at": null,
+  "replayed": false
+}
+```
+
+**激活计划**：
+
+```bash
+curl -X POST http://localhost:8000/pools/1/bgp-plans/release-2026-10-03/activate
+```
+
+激活在**单个 `BEGIN IMMEDIATE` 写事务**内重新读取池的排除与分配，重新计算摘要：
+只有 `state_digest` 与创建时固定的摘要**完全一致**、且用计划内已审计公告重新验证
+覆盖关系与单一起源仍然成立时，才把 `status` 置为 `active` 并记录 `activated_at`。
+期间池发生任何变化——新增/释放/重分配（即使又分配回同一 CIDR、同一
+`request_id`，行的 `created_at` 不同也算）、追加排除网段——都返回
+`409 bgp_plan_state_conflict`，事务回滚，**不会部分生效**，计划保持
+`planned` 可稍后重试。
+
+**幂等语义**：
+
+- 相同 `plan_id` + 相同参数（AS 关系去重排序、公告按 id 排序，与书写顺序无关）
+  重放创建请求：返回已存储计划，HTTP 200、`replayed: true`，计划只创建一次；
+  计划已激活后重放则返回 `active` 状态的原计划；
+- 相同 `plan_id` 但参数变化（不同池、不同关系或不同公告集合）：
+  `409 bgp_plan_id_conflict`；
+- 重复激活已 `active` 的计划：幂等返回原结果（`replayed: true`，
+  `activated_at` 不变），不再重新核对池状态；
+- 并发使用同一 `plan_id` 创建由写事务串行化，恰好产生一条计划；并发激活与分配
+  也被串行化：要么激活先提交（成功），要么分配先提交（激活返回冲突），不会出现
+  部分生效。
+
 ## 错误响应
 
 统一格式：
@@ -619,6 +722,13 @@ curl -X POST http://localhost:8000/pools/1/partitions \
 | 422 | `as_relation_unknown` | 公告路径中某对相邻 ASN 没有声明关系（detail 含公告 id、hop 与两端 ASN） |
 | 422 | `invalid_prefix` / `invalid_as_path` | 公告前缀非法（含主机位、非 IPv4 等）或 AS_PATH 为空 |
 | 422 | `duplicate_announcement_id` | 请求内两条公告使用相同 `id` |
+| 404 | `bgp_plan_not_found` | 激活的计划不存在，或计划属于其他池 |
+| 409 | `bgp_plan_id_conflict` | 同一 `plan_id` 以不同参数（池、关系或公告集合）重放 |
+| 409 | `bgp_plan_state_conflict` | 计划创建/激活时池状态已变：摘要不一致或覆盖关系不再成立 |
+| 422 | `bgp_announcement_outside_pool` | 公告前缀不完全位于地址池内 |
+| 422 | `bgp_announcement_overlaps_exclusion` | 公告前缀与池的排除网段重叠 |
+| 422 | `bgp_allocation_uncovered` | 存在当前分配未被任何审计通过的公告覆盖 |
+| 422 | `bgp_allocation_origin_conflict` | 同一分配被不同起源 AS 的公告覆盖 |
 
 注：`as_loop` 与 `invalid_path` 不是错误响应，而是成功响应中对应公告的
 `status`；后者还带 `violating_hop`。ASN 越界（0、≥4294967295）、关系/公告
@@ -640,6 +750,10 @@ curl -X POST http://localhost:8000/pools/1/partitions \
   完成：并发分区被串行化，对同一源池的并发分区只有一个成功（其余看到源池
   已退役而返回 404）；`pool_migrations.operation_id` 上的 `UNIQUE` 约束保证
   同一操作键并发/重放只真正迁移一次。
+- BGP 公告计划在创建时先用一致读事务固定池状态，再于写事务内复查状态未变后落库；
+  激活的全部核对（摘要一致、覆盖与单一起源重新成立）与状态翻转都在单个
+  `BEGIN IMMEDIATE` 写事务内完成，池状态变化即整体回滚返回冲突；
+  `bgp_plans.plan_id` 主键保证同一计划键并发/重放只保存一条不可变计划。
 - 数据库开启 WAL 模式，读状态不会阻塞写分配。
 
 ## 项目结构
@@ -654,6 +768,7 @@ curl -X POST http://localhost:8000/pools/1/partitions \
 │   ├── cidrmath.py    # CIDR 集合运算：差集、合并、最低对齐选取、委派片段拆分
 │   ├── cidrpolicy.py  # CIDR 策略编译：首条匹配规则 -> 不重叠动作分段（仅同级同动作合并）
 │   ├── bgpaudit.py    # BGP 公告无状态审计：路径折叠/AS 环/山谷自由 + MOAS/起源变更比对
+│   ├── bgpplan.py     # 可确认的 BGP 公告计划：固定池状态摘要，单写事务内重新核对后激活
 │   ├── reversedns.py  # RFC 2317 反向区名运算与 NS/CNAME/PTR 记录生成
 │   └── schemas.py     # Pydantic 模型
 ├── tests/             # pytest：算法单测 + API 集成 + 并发测试

@@ -11,7 +11,7 @@ from contextlib import asynccontextmanager
 from fastapi import FastAPI, Request, Response
 from fastapi.responses import JSONResponse
 
-from . import partition, service, snapshot
+from . import bgpplan, partition, service, snapshot
 from .db import init_db
 from .schemas import (
     AllocateRequest,
@@ -19,6 +19,8 @@ from .schemas import (
     AllocationItem,
     BgpAuditRequest,
     BgpAuditResponse,
+    BgpPlanCreateRequest,
+    BgpPlanResponse,
     CidrPolicyCompileRequest,
     CidrPolicyCompileResponse,
     ExclusionCreateRequest,
@@ -45,12 +47,13 @@ async def lifespan(app: FastAPI):
 
 app = FastAPI(
     title="IPv4 Subnet Allocation API",
-    version="1.4.0",
+    version="1.5.0",
     description=(
         "Allocate non-overlapping, aligned IPv4 subnets from address pools, "
         "partition pools into exactly covering sub-pools, "
         "build RFC 2317 reverse-DNS delegation plans for current allocations, "
-        "and statelessly audit BGP announcements against AS relationships."
+        "statelessly audit BGP announcements against AS relationships, "
+        "and record confirmable BGP announcement plans pinned to pool state."
     ),
     lifespan=lifespan,
 )
@@ -87,6 +90,31 @@ def compile_cidr_policy(body: CidrPolicyCompileRequest) -> CidrPolicyCompileResp
 def audit_bgp_announcements(body: BgpAuditRequest) -> BgpAuditResponse:
     result = service.audit_bgp_announcements(body.relationships, body.announcements)
     return BgpAuditResponse(**result)
+
+
+@app.post(
+    "/pools/{pool_id}/bgp-plans",
+    response_model=BgpPlanResponse,
+    status_code=201,
+    tags=["bgp"],
+)
+def create_bgp_plan(pool_id: int, body: BgpPlanCreateRequest, response: Response) -> BgpPlanResponse:
+    result = bgpplan.create_bgp_plan(
+        pool_id, body.plan_id, body.relationships, body.announcements
+    )
+    # 201 for a newly stored plan, 200 for an idempotent replay.
+    response.status_code = 200 if result["replayed"] else 201
+    return BgpPlanResponse(**result)
+
+
+@app.post(
+    "/pools/{pool_id}/bgp-plans/{plan_id}/activate",
+    response_model=BgpPlanResponse,
+    tags=["bgp"],
+)
+def activate_bgp_plan(pool_id: int, plan_id: str) -> BgpPlanResponse:
+    result = bgpplan.activate_bgp_plan(pool_id, plan_id)
+    return BgpPlanResponse(**result)
 
 
 @app.post("/pools", response_model=PoolResponse, status_code=201, tags=["pools"])

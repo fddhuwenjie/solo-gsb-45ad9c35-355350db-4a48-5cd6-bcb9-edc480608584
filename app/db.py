@@ -84,11 +84,29 @@ def init_db() -> None:
                 created_at      TEXT    NOT NULL
             );
 
-            -- Fast lookup of all allocations belonging to one pool.
+            -- Confirmable BGP announcement plans.  Every row is immutable
+            -- after creation: only ``status`` moves 'planned' -> 'active'
+            -- once, after the pinned pool state digest is re-verified.
+            -- Deleting the pool cascades to its plans.
+            CREATE TABLE IF NOT EXISTS bgp_plans (
+                plan_id          TEXT    PRIMARY KEY,
+                pool_id          INTEGER NOT NULL REFERENCES pools(id) ON DELETE CASCADE,
+                params           TEXT    NOT NULL,
+                audit_results    TEXT    NOT NULL,
+                pool_state       TEXT    NOT NULL,
+                state_digest     TEXT    NOT NULL,
+                status           TEXT    NOT NULL CHECK (status IN ('planned', 'active')),
+                created_at       TEXT    NOT NULL,
+                activated_at     TEXT
+            );
+
+            -- Fast lookup of all plans belonging to one pool.
             CREATE INDEX IF NOT EXISTS idx_allocations_pool
                 ON allocations(pool_id);
             CREATE INDEX IF NOT EXISTS idx_exclusions_pool
                 ON exclusions(pool_id);
+            CREATE INDEX IF NOT EXISTS idx_bgp_plans_pool
+                ON bgp_plans(pool_id);
             """
         )
 
