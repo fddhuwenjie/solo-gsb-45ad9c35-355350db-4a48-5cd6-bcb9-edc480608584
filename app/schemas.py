@@ -393,3 +393,52 @@ class BgpAuditResponse(BaseModel):
             "Sorted by network address, then prefix length, then announcement id"
         ),
     )
+
+
+# ---------------------------------------------------------------------------
+# Confirmable BGP announcement plans
+# ---------------------------------------------------------------------------
+
+
+class AnnouncementPlanRequest(BaseModel):
+    plan_id: str = Field(
+        ...,
+        min_length=1,
+        description="Client-generated idempotency key for the plan",
+    )
+    pool_id: int = Field(
+        ..., ge=1, description="Pool the announcements are checked against"
+    )
+    relationships: list[AsRelation] = Field(
+        default_factory=list,
+        description="AS relationships used by the reused path audit",
+    )
+    announcements: list[BgpAnnouncement] = Field(
+        ...,
+        min_length=1,
+        description="Announcements to vet and pin; ids must be unique",
+    )
+
+
+class AnnouncementPlanResponse(BaseModel):
+    plan_id: str
+    pool_id: int
+    status: Literal["pending", "active"]
+    pool_digest: str = Field(
+        ...,
+        description="SHA-256 hex of the canonical pool state the plan is pinned to",
+    )
+    results: list[BgpAuditResult] = Field(
+        ..., description="Audit results for the pinned announcements"
+    )
+    created_at: str
+    replayed: bool
+
+
+class AnnouncementPlanActivationResponse(BaseModel):
+    plan_id: str
+    pool_id: int
+    status: Literal["active"]
+    pool_digest: str
+    activated_at: str
+    replayed: bool

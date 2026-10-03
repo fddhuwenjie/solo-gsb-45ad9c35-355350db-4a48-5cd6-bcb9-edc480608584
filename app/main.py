@@ -11,12 +11,15 @@ from contextlib import asynccontextmanager
 from fastapi import FastAPI, Request, Response
 from fastapi.responses import JSONResponse
 
-from . import partition, service, snapshot
+from . import bgpplan, partition, service, snapshot
 from .db import init_db
 from .schemas import (
     AllocateRequest,
     AllocationResponse,
     AllocationItem,
+    AnnouncementPlanActivationResponse,
+    AnnouncementPlanRequest,
+    AnnouncementPlanResponse,
     BgpAuditRequest,
     BgpAuditResponse,
     CidrPolicyCompileRequest,
@@ -45,12 +48,13 @@ async def lifespan(app: FastAPI):
 
 app = FastAPI(
     title="IPv4 Subnet Allocation API",
-    version="1.4.0",
+    version="1.5.0",
     description=(
         "Allocate non-overlapping, aligned IPv4 subnets from address pools, "
         "partition pools into exactly covering sub-pools, "
         "build RFC 2317 reverse-DNS delegation plans for current allocations, "
-        "and statelessly audit BGP announcements against AS relationships."
+        "statelessly audit BGP announcements against AS relationships, "
+        "and pin confirmable BGP announcement plans to the current pool state."
     ),
     lifespan=lifespan,
 )
@@ -87,6 +91,28 @@ def compile_cidr_policy(body: CidrPolicyCompileRequest) -> CidrPolicyCompileResp
 def audit_bgp_announcements(body: BgpAuditRequest) -> BgpAuditResponse:
     result = service.audit_bgp_announcements(body.relationships, body.announcements)
     return BgpAuditResponse(**result)
+
+
+@app.post(
+    "/bgp/announcement-plans",
+    response_model=AnnouncementPlanResponse,
+    status_code=201,
+    tags=["bgp"],
+)
+def create_announcement_plan(body: AnnouncementPlanRequest) -> AnnouncementPlanResponse:
+    result = bgpplan.create_plan(
+        body.plan_id, body.pool_id, body.relationships, body.announcements
+    )
+    return AnnouncementPlanResponse(**result)
+
+
+@app.post(
+    "/bgp/announcement-plans/{plan_id}/activate",
+    response_model=AnnouncementPlanActivationResponse,
+    tags=["bgp"],
+)
+def activate_announcement_plan(plan_id: str) -> AnnouncementPlanActivationResponse:
+    return AnnouncementPlanActivationResponse(**bgpplan.activate_plan(plan_id))
 
 
 @app.post("/pools", response_model=PoolResponse, status_code=201, tags=["pools"])

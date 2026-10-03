@@ -13,6 +13,7 @@
 - 可将地址池**分区迁移**为一组两两不重叠、恰好覆盖源池的子池：全部校验与替换在**同一个写事务**内完成，排除网段与已分配子网按归属整体迁入子池（`operation_id` 幂等重放）
 - 可将按优先级排列的 CIDR 允许/拒绝规则**编译**为覆盖整个 scope 的不重叠分段（只读，不触碰地址池与分配数据）
 - 可对 BGP 公告做**无状态 AS 路径审计与 MOAS / 起源变更比对**（只计算，不读写数据库）
+- 可创建**可确认的 BGP 公告计划**：创建时在单写事务内固定池状态摘要并复用路径审计，激活前重核池状态未变才生效，过期计划返回冲突且不得部分生效（`plan_id` 幂等）
 - 一条命令启动，监听 **8000** 端口
 
 ## 快速开始
@@ -60,6 +61,8 @@ SUBNET_DB_PATH=./subnets.db .venv/bin/uvicorn app.main:app --host 0.0.0.0 --port
 | `POST` | `/pools/{id}/partitions` | 将源池分区迁移为一组恰好覆盖它的子池（单写事务，`operation_id` 幂等） |
 | `POST` | `/cidr-policy/compile` | 将优先级 CIDR 规则编译为覆盖 scope 的不重叠动作分段（只读） |
 | `POST` | `/bgp/announcements/audit` | BGP 公告 AS 路径审计与 MOAS / 起源变更比对（无状态，不读写数据库） |
+| `POST` | `/bgp/announcement-plans` | 创建可确认的 BGP 公告计划：固定池状态摘要并复用路径审计（`plan_id` 幂等） |
+| `POST` | `/bgp/announcement-plans/{plan_id}/activate` | 单写事务内重核池状态未变后激活计划（变化则 409，不得部分生效） |
 | `GET` | `/health` | 健康检查 |
 
 ### 1. 创建地址池
@@ -570,6 +573,82 @@ curl -X POST http://localhost:8000/pools/1/partitions \
 `request_id` 幂等键随分配一起归属新子池；子网列表只有一个且等于源池 CIDR 的
 退化分区也是合法请求（源池被同 CIDR 的新池替换，池 id 改变）。
 
+### 13. BGP 公告计划（创建时固定池状态，激活前再确认）
+
+网络团队在**发布** BGP 公告前，需要确认公告仍对应当前地址池，避免池内分配变化后
+激活过期路由。`POST /bgp/announcement-plans` 创建一份**可确认的公告计划**：调用方
+提交 `plan_id`（幂等键）、`pool_id`、AS 关系与公告列表（两者格式同第 11 节）。
+创建时复用第 11 节的路径审计，并在单个 `BEGIN IMMEDIATE` 写事务内**固定池的排除
+网段与当前分配**（一致快照），依次校验：
+
+1. 每条公告前缀**完全位于池内**（`422 plan_prefix_outside_pool`）且**不与任何排除
+   网段重叠**（`422 plan_prefix_overlap_exclusion`）——无论该公告是否通过路径审计；
+2. **每个当前分配**至少被一条**通过审计**（`status: "valid"`）的公告覆盖
+   （`422 plan_allocation_uncovered`；`as_loop` / `invalid_path` 的公告不参与覆盖）；
+3. 同一分配不被**不同起源**的公告同时覆盖（`422 plan_origin_conflict`；同起源的
+   多条覆盖公告是允许的）。
+
+全部通过后，计划与**池状态摘要** `pool_digest`（池 CIDR + 排除网段 + 分配的规范
+SHA-256）一起**不可变**保存，状态为 `pending`。沿用第 1、2 节的池
+（`10.10.0.0/22`，排除 `10.10.2.0/24`，已分配 `10.10.0.0/24`）：
+
+```bash
+curl -X POST http://localhost:8000/bgp/announcement-plans \
+  -H 'Content-Type: application/json' -d '{
+    "plan_id": "bcast-2026-10-03",
+    "pool_id": 1,
+    "relationships": [
+      {"type": "customer_provider", "customer": 10, "provider": 100}
+    ],
+    "announcements": [
+      {"id": "a1", "prefix": "10.10.0.0/23", "as_path": [10, 100]}
+    ]
+  }'
+```
+
+（公告 `10.10.0.0/23` 覆盖分配 `10.10.0.0/24`，且不碰排除网段 `10.10.2.0/24`。）
+
+```json
+{
+  "plan_id": "bcast-2026-10-03",
+  "pool_id": 1,
+  "status": "pending",
+  "pool_digest": "9f2c1a…（64 位十六进制）",
+  "results": [
+    {"id": "a1", "prefix": "10.10.0.0/23", "as_path": [10, 100],
+     "origin": 100, "status": "valid", "flags": [], "violating_hop": null}
+  ],
+  "created_at": "2026-10-03T08:00:00+00:00",
+  "replayed": false
+}
+```
+
+**幂等**：相同 `plan_id` + 相同参数（关系与公告集合，顺序无关）重试返回原结果
+（`replayed: true`），不会重复保存；同一 `plan_id` 换参数返回
+`409 plan_id_conflict`。
+
+`POST /bgp/announcement-plans/{plan_id}/activate` **激活**计划：在单个写事务内
+重新核对 `pool_digest` 与当前分配——只有池状态**未变**且覆盖关系**仍成立**才标记
+`active`；任一变化（新增/释放分配、新增排除等）返回 `409 plan_stale` 且整体回滚，
+**不会部分生效**。冲突不是终态：池状态恢复后同一计划仍可激活。已激活的计划重复
+激活返回原结果（`replayed: true`）；计划随源池分区迁移一起删除，此后激活返回
+`404 plan_not_found`。
+
+```bash
+curl -X POST http://localhost:8000/bgp/announcement-plans/bcast-2026-10-03/activate
+```
+
+```json
+{
+  "plan_id": "bcast-2026-10-03",
+  "pool_id": 1,
+  "status": "active",
+  "pool_digest": "9f2c1a…（与创建时一致）",
+  "activated_at": "2026-10-03T09:30:00+00:00",
+  "replayed": false
+}
+```
+
 ## 错误响应
 
 统一格式：
@@ -581,6 +660,7 @@ curl -X POST http://localhost:8000/pools/1/partitions \
 | 状态码 | code | 场景 |
 | --- | --- | --- |
 | 404 | `pool_not_found` / `allocation_not_found` | 池或分配不存在 |
+| 404 | `plan_not_found` | 公告计划不存在（含已随源池分区删除的计划） |
 | 409 | `pool_exists` / `exclusion_exists` | 池或排除网段已存在 |
 | 409 | `exclusion_overlap` | 排除网段越界占用 |
 | 409 | `pool_exhausted` | 无足够连续空闲空间 |
@@ -588,6 +668,8 @@ curl -X POST http://localhost:8000/pools/1/partitions \
 | 409 | `restore_id_conflict` | 同一 `restore_id` 曾用于另一池或另一份摘要 |
 | 409 | `snapshot_restore_conflict` | 恢复写入时撞上数据库唯一约束（如池 CIDR 重复） |
 | 409 | `operation_id_conflict` | 同一 `operation_id` 曾用于另一源池或另一组子网的分区 |
+| 409 | `plan_id_conflict` | 同一 `plan_id` 曾用于另一组参数的公告计划 |
+| 409 | `plan_stale` | 激活时池状态摘要或覆盖关系已变化（未做任何修改） |
 | 409 | `partition_pool_conflict` | 子池 CIDR 与其他现有地址池重叠 |
 | 409 | `partition_conflict` | 分区写入时撞上数据库唯一约束 |
 | 422 | `partition_outside_pool` / `partition_overlap` / `partition_incomplete` | 分区子网不在源池内、两两重叠（含重复）或未恰好覆盖源池 |
@@ -619,6 +701,8 @@ curl -X POST http://localhost:8000/pools/1/partitions \
 | 422 | `as_relation_unknown` | 公告路径中某对相邻 ASN 没有声明关系（detail 含公告 id、hop 与两端 ASN） |
 | 422 | `invalid_prefix` / `invalid_as_path` | 公告前缀非法（含主机位、非 IPv4 等）或 AS_PATH 为空 |
 | 422 | `duplicate_announcement_id` | 请求内两条公告使用相同 `id` |
+| 422 | `plan_prefix_outside_pool` / `plan_prefix_overlap_exclusion` | 计划中的公告前缀不在池内，或与排除网段重叠 |
+| 422 | `plan_allocation_uncovered` / `plan_origin_conflict` | 分配未被任何通过审计的公告覆盖，或被不同起源的公告同时覆盖 |
 
 注：`as_loop` 与 `invalid_path` 不是错误响应，而是成功响应中对应公告的
 `status`；后者还带 `violating_hop`。ASN 越界（0、≥4294967295）、关系/公告
@@ -640,6 +724,10 @@ curl -X POST http://localhost:8000/pools/1/partitions \
   完成：并发分区被串行化，对同一源池的并发分区只有一个成功（其余看到源池
   已退役而返回 404）；`pool_migrations.operation_id` 上的 `UNIQUE` 约束保证
   同一操作键并发/重放只真正迁移一次。
+- 公告计划的创建在单个 `BEGIN IMMEDIATE` 写事务内固定池状态、完成校验并保存
+  （保存的摘要即提交时的真实状态）；激活同样在单个写事务内重核摘要与覆盖关系，
+  只有状态未变才标记 `active`，任一变化整体回滚（409，不产生部分生效）。
+  `announcement_plans.plan_id` 主键保证同一计划键并发/重放只创建一次。
 - 数据库开启 WAL 模式，读状态不会阻塞写分配。
 
 ## 项目结构
@@ -654,6 +742,7 @@ curl -X POST http://localhost:8000/pools/1/partitions \
 │   ├── cidrmath.py    # CIDR 集合运算：差集、合并、最低对齐选取、委派片段拆分
 │   ├── cidrpolicy.py  # CIDR 策略编译：首条匹配规则 -> 不重叠动作分段（仅同级同动作合并）
 │   ├── bgpaudit.py    # BGP 公告无状态审计：路径折叠/AS 环/山谷自由 + MOAS/起源变更比对
+│   ├── bgpplan.py     # 可确认公告计划：创建固定池状态摘要+复用审计，激活单写事务重核
 │   ├── reversedns.py  # RFC 2317 反向区名运算与 NS/CNAME/PTR 记录生成
 │   └── schemas.py     # Pydantic 模型
 ├── tests/             # pytest：算法单测 + API 集成 + 并发测试

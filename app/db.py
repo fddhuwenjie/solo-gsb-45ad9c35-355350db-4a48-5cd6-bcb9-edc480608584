@@ -84,6 +84,22 @@ def init_db() -> None:
                 created_at      TEXT    NOT NULL
             );
 
+            -- One row per confirmable BGP announcement plan; the primary key
+            -- makes a repeated plan_id replay the original result instead of
+            -- storing the plan twice.  The plan row is immutable except for
+            -- the pending -> active transition; it disappears together with
+            -- its pool (e.g. a partition retires the source pool).
+            CREATE TABLE IF NOT EXISTS announcement_plans (
+                plan_id      TEXT    PRIMARY KEY,
+                pool_id      INTEGER NOT NULL REFERENCES pools(id) ON DELETE CASCADE,
+                status       TEXT    NOT NULL,
+                request_hash TEXT    NOT NULL,
+                pool_digest  TEXT    NOT NULL,
+                plan         TEXT    NOT NULL,
+                created_at   TEXT    NOT NULL,
+                activated_at TEXT
+            );
+
             -- Fast lookup of all allocations belonging to one pool.
             CREATE INDEX IF NOT EXISTS idx_allocations_pool
                 ON allocations(pool_id);
